@@ -56,6 +56,24 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 }
 .metric-val { font-size: 1.4em; font-weight: 700; color: #38bdf8; }
 .metric-lbl { font-size: 0.75em; color: #64748b; margin-top: 2px; }
+
+/* Settings toggle button */
+.settings-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 8px 14px;
+    color: #94a3b8;
+    font-size: 0.9em;
+    cursor: pointer;
+    margin-bottom: 4px;
+}
+.settings-toggle:hover { background: #263548; border-color: #3b82f6; color: #e2e8f0; }
+
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
@@ -78,6 +96,7 @@ def init_state():
         "top_k": 6,
         "rerank_top_n": 3,
         "use_reranker": True,
+        "settings_open": False,   # ← NEW: retrieval settings collapsed by default
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -116,10 +135,10 @@ with st.sidebar:
         st.session_state.model          = DEFAULT_MODELS[new_provider]
         st.session_state.llm_configured = False
 
-    model_map       = model_display_names(st.session_state.provider)
-    model_ids       = list(model_map.keys())
-    model_labels    = list(model_map.values())
-    cur_model_idx   = model_ids.index(st.session_state.model) if st.session_state.model in model_ids else 0
+    model_map            = model_display_names(st.session_state.provider)
+    model_ids            = list(model_map.keys())
+    model_labels         = list(model_map.values())
+    cur_model_idx        = model_ids.index(st.session_state.model) if st.session_state.model in model_ids else 0
     selected_model_label = st.selectbox("Model", model_labels, index=cur_model_idx)
     st.session_state.model = model_ids[model_labels.index(selected_model_label)]
 
@@ -167,8 +186,8 @@ with st.sidebar:
         new_files = [f for f in uploaded_files if f.name not in st.session_state.docs_indexed]
         if new_files:
             if st.button(f"⚙️ Process {len(new_files)} new file(s)", use_container_width=True):
-                engine      = get_or_create_engine()
-                progress    = st.progress(0)
+                engine       = get_or_create_engine()
+                progress     = st.progress(0)
                 total_chunks = 0
                 for i, uf in enumerate(new_files):
                     with st.spinner(f"Indexing {uf.name}…"):
@@ -206,7 +225,9 @@ with st.sidebar:
     )
     st.caption(policy_descriptions[st.session_state.policy_mode])
 
-    policy_doc = st.file_uploader("Upload policy document (optional)", type=["pdf", "txt"], key="policy_upload")
+    policy_doc = st.file_uploader(
+        "Upload policy document (optional)", type=["pdf", "txt"], key="policy_upload"
+    )
     if policy_doc:
         if policy_doc.name.endswith(".pdf"):
             from core.rag_engine import DocumentParser
@@ -223,18 +244,34 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Retrieval Settings — FIXED INDENT ─────────────────────────────────
-    with st.expander("⚙️ Retrieval Settings", expanded=True):
-        st.session_state.top_k = st.slider(
-            "Initial retrieval (top-K)", 3, 12, st.session_state.top_k
-        )
-        st.session_state.rerank_top_n = st.slider(
-            "After reranking (top-N)", 1, 6, st.session_state.rerank_top_n
-        )
-        st.caption(
-            f"Fetches {st.session_state.top_k} candidates, "
-            f"reranks to best {st.session_state.rerank_top_n}."
-        )
+    # ── Retrieval Settings — toggle button ────────────────────────────────
+    chevron = "▲" if st.session_state.settings_open else "▼"
+    toggle_label = f"⚙️ Retrieval Settings  {chevron}"
+
+    if st.button(toggle_label, use_container_width=True, key="settings_toggle_btn"):
+        st.session_state.settings_open = not st.session_state.settings_open
+        st.rerun()
+
+    if st.session_state.settings_open:
+        with st.container():
+            st.session_state.top_k = st.slider(
+                "Initial retrieval (top-K)",
+                min_value=3,
+                max_value=12,
+                value=st.session_state.top_k,
+                help="How many chunks to fetch from the vector index before reranking.",
+            )
+            st.session_state.rerank_top_n = st.slider(
+                "After reranking (top-N)",
+                min_value=1,
+                max_value=6,
+                value=st.session_state.rerank_top_n,
+                help="How many chunks to keep after the cross-encoder reranker scores them.",
+            )
+            st.caption(
+                f"Fetches **{st.session_state.top_k}** candidates → "
+                f"reranks to best **{st.session_state.rerank_top_n}**."
+            )
 
     st.divider()
     if st.button("🔄 Reset Session", use_container_width=True):
@@ -248,14 +285,19 @@ with st.sidebar:
 col_title, col_status = st.columns([3, 1])
 with col_title:
     st.markdown("# 📊 Financial Document Intelligence Assistant")
-    st.markdown("*Upload financial documents, then ask questions — grounded answers with full source attribution.*")
+    st.markdown(
+        "*Upload financial documents, then ask questions — "
+        "grounded answers with full source attribution.*"
+    )
 
 with col_status:
     engine_status = get_or_create_engine()
     llm_ok  = st.session_state.llm_configured
     docs_ok = bool(st.session_state.docs_indexed)
     st.markdown(f"**LLM:** {'🟢 Ready' if llm_ok else '🔴 Not connected'}")
-    st.markdown(f"**Index:** {'🟢 ' + str(engine_status.stats['total_chunks']) + ' chunks' if docs_ok else '🔴 No docs'}")
+    st.markdown(
+        f"**Index:** {'🟢 ' + str(engine_status.stats['total_chunks']) + ' chunks' if docs_ok else '🔴 No docs'}"
+    )
     st.markdown(f"**Reranker:** {'🟢 On' if engine_status._store.uses_reranker else '🟡 Off'}")
     st.markdown(f"**Mode:** `{st.session_state.policy_mode}`")
 
@@ -283,12 +325,19 @@ with chat_col:
 
     for turn in st.session_state.display_history:
         if turn["role"] == "user":
-            st.markdown(f'<div class="user-bubble">🧑 {turn["content"]}</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="user-bubble">🧑 {turn["content"]}</div>',
+                unsafe_allow_html=True,
+            )
         else:
-            st.markdown(f'<div class="assistant-bubble">🤖 {turn["content"]}</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="assistant-bubble">🤖 {turn["content"]}</div>',
+                unsafe_allow_html=True,
+            )
             if turn.get("results"):
                 with st.expander(
-                    f"📎 {len(turn['results'])} source(s) · ⚡ {turn.get('latency_ms', 0):.0f}ms retrieval",
+                    f"📎 {len(turn['results'])} source(s) · "
+                    f"⚡ {turn.get('latency_ms', 0):.0f}ms retrieval",
                     expanded=False,
                 ):
                     for i, r in enumerate(turn["results"], 1):
@@ -362,8 +411,14 @@ with insight_col:
     st.markdown("**System**")
     st.markdown(f"""
     <div class="metric-row">
-        <div class="metric-card"><div class="metric-val">{stats['total_chunks']}</div><div class="metric-lbl">Chunks</div></div>
-        <div class="metric-card"><div class="metric-val">{stats['chunk_size']}</div><div class="metric-lbl">Chunk size</div></div>
+        <div class="metric-card">
+            <div class="metric-val">{stats['total_chunks']}</div>
+            <div class="metric-lbl">Chunks</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-val">{stats['chunk_size']}</div>
+            <div class="metric-lbl">Chunk size</div>
+        </div>
     </div>""", unsafe_allow_html=True)
 
     st.markdown(f"""
@@ -379,7 +434,8 @@ with insight_col:
     st.markdown("**Last Query Sources**")
 
     last_assistant = next(
-        (t for t in reversed(st.session_state.display_history) if t["role"] == "assistant"), None
+        (t for t in reversed(st.session_state.display_history) if t["role"] == "assistant"),
+        None,
     )
 
     if last_assistant and last_assistant.get("results"):
@@ -403,8 +459,14 @@ with insight_col:
     n_turns = len([t for t in st.session_state.display_history if t["role"] == "user"])
     st.markdown(f"""
     <div class="metric-row">
-        <div class="metric-card"><div class="metric-val">{n_turns}</div><div class="metric-lbl">Questions</div></div>
-        <div class="metric-card"><div class="metric-val">{len(st.session_state.docs_indexed)}</div><div class="metric-lbl">Docs</div></div>
+        <div class="metric-card">
+            <div class="metric-val">{n_turns}</div>
+            <div class="metric-lbl">Questions</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-val">{len(st.session_state.docs_indexed)}</div>
+            <div class="metric-lbl">Docs</div>
+        </div>
     </div>""", unsafe_allow_html=True)
 
     if st.button("🗑️ Clear Chat History", use_container_width=True):
