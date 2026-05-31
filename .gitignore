@@ -1,0 +1,14 @@
+.env
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.DS_Store
+*.egg-info/
+dist/
+build/
+vectorstore_index/
+*.faiss
+*.pkl
