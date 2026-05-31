@@ -305,7 +305,7 @@ with st.sidebar:
     st.divider()
 
     # ── Retrieval Settings ─────────────────────────────────────────────────
-    with st.expander("⚙️ Retrieval Settings", expanded=False):
+   with st.expander("⚙️ Retrieval Settings", expanded=True):
         st.session_state.top_k = st.slider(
             "Initial retrieval (top-K)", 3, 12, st.session_state.top_k
         )
