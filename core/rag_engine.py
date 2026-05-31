@@ -551,3 +551,4 @@ class FinancialRAGEngine:
             "llm_provider":  self._llm.provider or "not configured",
             "llm_model":     self._llm.model or "not configured",
         }
+
