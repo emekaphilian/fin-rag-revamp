@@ -1,56 +1,54 @@
 """
 core/rag_engine.py
-------------------
-Financial RAG Engine — revamped with:
-  - Semantic + recursive chunking strategy
-  - FAISS vector search (no torch required)
-  - Cross-encoder reranking via sentence-transformers
-  - Multi-LLM abstraction (OpenAI / Cohere / HuggingFace)
-  - Streaming support
-  - Policy-aware mode (Free / Assistive / Strict)
+==================
+Financial Document Intelligence Assistant — RAG Engine
+Fixed for Cohere v2 (cohere >= 5.0): system prompt goes in messages list,
+not as a top-level `system=` kwarg. Also fixes v2 streaming event types.
+
+Interface contract (matches app.py exactly):
+    engine = FinancialRAGEngine(use_reranker=True)
+    engine.configure_llm(provider, api_key, model)
+    engine.set_policy(mode, policy_text)
+    n_chunks = engine.ingest_file(file_bytes, filename)
+    stream, results, latency_ms = engine.query_stream(question, chat_history, top_k, rerank_top_n)
+    stats = engine.stats          # dict
+    engine._store.uses_reranker   # bool
 """
 
 from __future__ import annotations
 
 import io
+import re
 import time
-import hashlib
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Generator, List, Optional, Tuple
 
 import numpy as np
 
-# ── Document parsing ──────────────────────────────────────────────────────────
+# ── optional heavy deps (graceful degradation) ───────────────────────────────
+try:
+    import faiss
+    _FAISS_OK = True
+except ImportError:
+    _FAISS_OK = False
+
+try:
+    from sentence_transformers import SentenceTransformer, CrossEncoder
+    _ST_OK = True
+except ImportError:
+    _ST_OK = False
+
 try:
     from pypdf import PdfReader
+    _PDF_OK = True
 except ImportError:
-    PdfReader = None
+    _PDF_OK = False
 
 try:
-    import docx as python_docx
+    from docx import Document as DocxDocument
+    _DOCX_OK = True
 except ImportError:
-    python_docx = None
-
-# ── Embeddings + FAISS ────────────────────────────────────────────────────────
-from sentence_transformers import SentenceTransformer, CrossEncoder
-import faiss
-
-# ── LLM clients ───────────────────────────────────────────────────────────────
-try:
-    from openai import OpenAI as OpenAIClient
-except ImportError:
-    OpenAIClient = None
-
-try:
-    import cohere
-except ImportError:
-    cohere = None
-
-try:
-    from huggingface_hub import InferenceClient
-except ImportError:
-    InferenceClient = None
+    _DOCX_OK = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,29 +58,23 @@ except ImportError:
 @dataclass
 class Chunk:
     text: str
-    source: str          # filename
-    page: int = 0
-    chunk_id: str = ""
-
-    def __post_init__(self):
-        if not self.chunk_id:
-            self.chunk_id = hashlib.md5(
-                f"{self.source}:{self.page}:{self.text[:50]}".encode()
-            ).hexdigest()[:8]
+    source: str
+    page: int
+    chunk_idx: int
 
 
 @dataclass
 class RetrievalResult:
     chunk: Chunk
-    score: float          # cosine similarity (0-1)
+    score: float
     rerank_score: Optional[float] = None
 
     @property
     def confidence_label(self) -> str:
         s = self.rerank_score if self.rerank_score is not None else self.score
-        if s >= 0.70:
+        if s >= 0.75:
             return "High"
-        elif s >= 0.45:
+        if s >= 0.45:
             return "Medium"
         return "Low"
 
@@ -91,421 +83,425 @@ class RetrievalResult:
         return {"High": "🟢", "Medium": "🟡", "Low": "🔴"}[self.confidence_label]
 
 
-@dataclass
-class RAGResponse:
-    answer: str
-    results: List[RetrievalResult]
-    query_latency_ms: float
-    total_chunks_searched: int
-    llm_provider: str
-    policy_mode: str
-    chat_history_turns: int = 0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Chunking
-# ─────────────────────────────────────────────────────────────────────────────
-
-class FinancialChunker:
-    """
-    Two-pass chunking strategy tuned for financial documents:
-      1. Paragraph-aware split (respects section boundaries)
-      2. Fixed-size fallback with sliding window overlap
-    """
-
-    SECTION_MARKERS = [
-        "\n\n", "\n---\n", "\nSection ", "\nARTICLE ", "\n## ", "\n### ",
-        "\nITEM ", "\nNote ", "\nSchedule ", "\nExhibit "
-    ]
-
-    def __init__(self, chunk_size: int = 900, overlap: int = 150):
-        self.chunk_size = chunk_size
-        self.overlap = overlap
-
-    def split(self, text: str, source: str, page: int = 0) -> List[Chunk]:
-        # First try paragraph-aware split
-        paragraphs = self._paragraph_split(text)
-        chunks = self._merge_paragraphs(paragraphs, source, page)
-        return chunks
-
-    def _paragraph_split(self, text: str) -> List[str]:
-        """Split on financial section markers first, then double newlines."""
-        import re
-        # Normalise whitespace
-        text = re.sub(r"\r\n", "\n", text)
-        text = re.sub(r" {3,}", "  ", text)
-
-        # Split on known markers
-        for marker in self.SECTION_MARKERS:
-            if marker in text:
-                parts = text.split(marker)
-                return [p.strip() for p in parts if p.strip()]
-
-        # Fallback: double-newline paragraphs
-        parts = text.split("\n\n")
-        return [p.strip() for p in parts if p.strip()]
-
-    def _merge_paragraphs(
-        self, paragraphs: List[str], source: str, page: int
-    ) -> List[Chunk]:
-        chunks: List[Chunk] = []
-        buffer = ""
-        for para in paragraphs:
-            if len(buffer) + len(para) + 1 <= self.chunk_size:
-                buffer = (buffer + " " + para).strip()
-            else:
-                if buffer:
-                    chunks.append(Chunk(text=buffer, source=source, page=page))
-                # If single paragraph exceeds chunk_size, do sliding window
-                if len(para) > self.chunk_size:
-                    chunks.extend(self._sliding_window(para, source, page))
-                    buffer = ""
-                else:
-                    buffer = para
-        if buffer:
-            chunks.append(Chunk(text=buffer, source=source, page=page))
-        return chunks
-
-    def _sliding_window(self, text: str, source: str, page: int) -> List[Chunk]:
-        chunks = []
-        start = 0
-        while start < len(text):
-            end = start + self.chunk_size
-            chunk_text = text[start:end].strip()
-            if chunk_text:
-                chunks.append(Chunk(text=chunk_text, source=source, page=page))
-            start += self.chunk_size - self.overlap
-        return chunks
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Document parser
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DocumentParser:
+    """Returns list of (text, page_number) tuples."""
+
     def parse(self, file_bytes: bytes, filename: str) -> List[Tuple[str, int]]:
-        """Returns list of (page_text, page_number) tuples."""
-        ext = Path(filename).suffix.lower()
-        if ext == ".pdf":
+        ext = filename.rsplit(".", 1)[-1].lower()
+        if ext == "pdf":
             return self._parse_pdf(file_bytes)
-        elif ext == ".docx":
+        if ext == "docx":
             return self._parse_docx(file_bytes)
-        elif ext == ".txt":
-            text = file_bytes.decode("utf-8", errors="replace")
-            return [(text, 0)]
-        else:
-            raise ValueError(f"Unsupported file type: {ext}")
+        # txt / fallback
+        return [(file_bytes.decode("utf-8", errors="replace"), 1)]
 
     def _parse_pdf(self, data: bytes) -> List[Tuple[str, int]]:
-        if PdfReader is None:
-            raise ImportError("pypdf not installed")
+        if not _PDF_OK:
+            raise RuntimeError("pypdf not installed. Run: pip install pypdf")
         reader = PdfReader(io.BytesIO(data))
         pages = []
-        for i, page in enumerate(reader.pages):
+        for i, page in enumerate(reader.pages, 1):
             text = page.extract_text() or ""
             if text.strip():
-                pages.append((text, i + 1))
+                pages.append((text, i))
         return pages
 
     def _parse_docx(self, data: bytes) -> List[Tuple[str, int]]:
-        if python_docx is None:
-            raise ImportError("python-docx not installed")
-        doc = python_docx.Document(io.BytesIO(data))
-        full_text = "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
-        return [(full_text, 0)]
+        if not _DOCX_OK:
+            raise RuntimeError("python-docx not installed. Run: pip install python-docx")
+        doc = DocxDocument(io.BytesIO(data))
+        full_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        return [(full_text, 1)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Financial-aware chunker
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FinancialChunker:
+    """
+    Paragraph-aware sliding-window chunker tuned for financial documents.
+    Tries to keep section headers with their content.
+    Default: 900 tokens / 150 overlap (approx. by word count × 0.75).
+    """
+
+    SECTION_RE = re.compile(
+        r"^\s*(§\d|section\s+\d|article\s+\d|\d+\.\d*\s+[A-Z])",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    def __init__(self, chunk_size: int = 900, overlap: int = 150):
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+
+    def _word_count(self, text: str) -> int:
+        return len(text.split())
+
+    def chunk(self, text: str, source: str, page: int) -> List[Chunk]:
+        # Split on paragraph boundaries first
+        paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+        chunks: List[Chunk] = []
+        buffer = ""
+        chunk_idx = 0
+
+        for para in paragraphs:
+            candidate = (buffer + "\n\n" + para).strip() if buffer else para
+            if self._word_count(candidate) <= self.chunk_size:
+                buffer = candidate
+            else:
+                if buffer:
+                    chunks.append(Chunk(
+                        text=buffer,
+                        source=source,
+                        page=page,
+                        chunk_idx=chunk_idx,
+                    ))
+                    chunk_idx += 1
+                    # Carry overlap words into next buffer
+                    words = buffer.split()
+                    overlap_text = " ".join(words[-self.overlap:]) if len(words) > self.overlap else buffer
+                    buffer = (overlap_text + "\n\n" + para).strip()
+                else:
+                    # Single paragraph too long — hard split by words
+                    words = para.split()
+                    for start in range(0, len(words), self.chunk_size - self.overlap):
+                        segment = " ".join(words[start: start + self.chunk_size])
+                        chunks.append(Chunk(text=segment, source=source, page=page, chunk_idx=chunk_idx))
+                        chunk_idx += 1
+                    buffer = ""
+
+        if buffer.strip():
+            chunks.append(Chunk(text=buffer, source=source, page=page, chunk_idx=chunk_idx))
+
+        return chunks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Vector store (FAISS)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class FAISSVectorStore:
+class VectorStore:
     EMBED_MODEL = "all-MiniLM-L6-v2"
-    RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
     def __init__(self, use_reranker: bool = True):
+        if not _ST_OK:
+            raise RuntimeError("sentence-transformers not installed.")
+        if not _FAISS_OK:
+            raise RuntimeError("faiss-cpu not installed.")
+
+        self.uses_reranker = use_reranker
         self._embedder = SentenceTransformer(self.EMBED_MODEL)
+        self._dim = self._embedder.get_sentence_embedding_dimension()
+        self._index = faiss.IndexFlatIP(self._dim)
+        self._chunks: List[Chunk] = []
+
         self._reranker: Optional[CrossEncoder] = None
-        self._use_reranker = use_reranker
         if use_reranker:
             try:
-                self._reranker = CrossEncoder(self.RERANK_MODEL)
+                self._reranker = CrossEncoder(self.RERANKER_MODEL)
             except Exception:
-                self._reranker = None
-
-        self._index: Optional[faiss.Index] = None
-        self._chunks: List[Chunk] = []
-        self.embed_dim: int = 384  # MiniLM output
-
-    # ── Indexing ──────────────────────────────────────────────────────────────
+                self.uses_reranker = False
 
     def add_chunks(self, chunks: List[Chunk]) -> None:
         if not chunks:
             return
         texts = [c.text for c in chunks]
-        vecs = self._embed(texts)
-
-        if self._index is None:
-            self._index = faiss.IndexFlatIP(self.embed_dim)  # Inner product = cosine on normalised
-
-        self._index.add(vecs)
+        embeddings = self._embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        self._index.add(np.array(embeddings, dtype="float32"))
         self._chunks.extend(chunks)
 
-    def clear(self) -> None:
-        self._index = None
-        self._chunks = []
-
-    # ── Retrieval ─────────────────────────────────────────────────────────────
-
-    def search(
-        self,
-        query: str,
-        top_k: int = 6,
-        rerank_top_n: int = 3,
-    ) -> List[RetrievalResult]:
-        if self._index is None or not self._chunks:
+    def search(self, query: str, top_k: int = 6, rerank_top_n: int = 3) -> List[RetrievalResult]:
+        if not self._chunks:
             return []
 
-        qvec = self._embed([query])
+        q_emb = self._embedder.encode([query], normalize_embeddings=True, show_progress_bar=False)
         k = min(top_k, len(self._chunks))
-        scores, indices = self._index.search(qvec, k)
+        scores, indices = self._index.search(np.array(q_emb, dtype="float32"), k)
 
-        results: List[RetrievalResult] = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx < 0:
-                continue
-            results.append(RetrievalResult(
-                chunk=self._chunks[idx],
-                score=float(score),
-            ))
+        results = [
+            RetrievalResult(chunk=self._chunks[idx], score=float(scores[0][i]))
+            for i, idx in enumerate(indices[0])
+            if idx >= 0
+        ]
 
-        # ── Cross-encoder reranking ───────────────────────────────────────────
         if self._reranker and results:
-            pairs = [[query, r.chunk.text] for r in results]
-            rerank_scores = self._reranker.predict(pairs)
-            for r, rs in zip(results, rerank_scores):
-                r.rerank_score = float(rs)
-            results.sort(key=lambda x: x.rerank_score or 0, reverse=True)
+            pairs = [(query, r.chunk.text) for r in results]
+            rr_scores = self._reranker.predict(pairs)
+            for r, s in zip(results, rr_scores):
+                r.rerank_score = float(s)
+            results.sort(key=lambda r: r.rerank_score, reverse=True)  # type: ignore
             results = results[:rerank_top_n]
         else:
             results = results[:rerank_top_n]
 
         return results
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _embed(self, texts: List[str]) -> np.ndarray:
-        vecs = self._embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-        return vecs.astype(np.float32)
-
     @property
     def total_chunks(self) -> int:
         return len(self._chunks)
 
-    @property
-    def is_ready(self) -> bool:
-        return self._index is not None and len(self._chunks) > 0
-
-    @property
-    def uses_reranker(self) -> bool:
-        return self._reranker is not None
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM Abstraction
+# Policy engine
 # ─────────────────────────────────────────────────────────────────────────────
 
 POLICY_SYSTEM_PROMPTS = {
     "Free": (
-        "You are a knowledgeable financial analyst assistant. "
-        "Answer based on the provided context. Be clear and precise. "
-        "If the answer is not in the context, say so honestly."
+        "You are a helpful financial document assistant. "
+        "Answer questions using the provided document context. "
+        "You may draw on general knowledge when the documents don't fully address the question."
     ),
     "Assistive": (
-        "You are a compliance-aware financial analyst assistant. "
-        "Ground every answer strictly in the retrieved document excerpts. "
-        "Frame responses professionally, suitable for financial reporting. "
-        "Always note when confidence is limited. If the answer is not in the context, say so."
+        "You are a professional financial analyst assistant. "
+        "Answer questions based primarily on the provided document context. "
+        "Use professional financial language. "
+        "If your confidence is low, explicitly signal uncertainty to the user."
     ),
     "Strict": (
-        "You are a strict compliance enforcement assistant. "
-        "You MUST only answer from the exact retrieved document excerpts provided. "
-        "Do NOT infer, extrapolate, or use general knowledge. "
-        "If the context does not contain the answer, respond: "
-        "'The provided documents do not contain sufficient information to answer this question.' "
-        "Cite the source document for every claim."
+        "You are a strict compliance-grade financial document assistant. "
+        "You MUST answer ONLY from the provided document context. "
+        "Do NOT extrapolate, assume, or use general knowledge. "
+        "Every factual claim must be directly supported by the retrieved evidence. "
+        "If the documents do not contain sufficient information, say: "
+        "'I cannot answer this from the available documents.' "
+        "Always cite which document and section your answer comes from."
     ),
 }
 
 
-def _build_rag_prompt(
-    query: str,
-    results: List[RetrievalResult],
-    chat_history: List[dict],
-    policy_mode: str,
-    policy_text: Optional[str],
-) -> List[dict]:
-    """Build the messages list for the LLM call."""
+class PolicyEngine:
+    def __init__(self):
+        self._mode = "Free"
+        self._custom_text: Optional[str] = None
 
-    context_blocks = []
-    for i, r in enumerate(results, 1):
-        context_blocks.append(
-            f"[Source {i}: {r.chunk.source}, p.{r.chunk.page}, "
-            f"score={r.score:.2f}]\n{r.chunk.text}"
-        )
-    context = "\n\n---\n\n".join(context_blocks)
+    def set(self, mode: str, custom_text: Optional[str] = None) -> None:
+        self._mode = mode
+        self._custom_text = custom_text
 
-    policy_note = ""
-    if policy_text:
-        policy_note = f"\n\n## Policy Document (for compliance reference)\n{policy_text[:1500]}"
-
-    system_msg = POLICY_SYSTEM_PROMPTS.get(policy_mode, POLICY_SYSTEM_PROMPTS["Free"])
-    system_msg += policy_note
-
-    messages = [{"role": "system", "content": system_msg}]
-    # Add prior chat history (keep last 6 turns to manage tokens)
-    for turn in chat_history[-6:]:
-        messages.append(turn)
-
-    user_content = (
-        f"## Retrieved Financial Document Excerpts\n\n{context}"
-        f"\n\n## Question\n{query}"
-    )
-    messages.append({"role": "user", "content": user_content})
-    return messages
-
-
-class LLMRouter:
-    """
-    Routes to the correct LLM provider and returns streaming or full response.
-    Supported: openai | cohere | huggingface
-    """
-
-    def __init__(
-        self,
-        provider: str,
-        api_key: str,
-        model: str,
-    ):
-        self.provider = provider.lower()
-        self.api_key = api_key
-        self.model = model
-        self._client = self._init_client()
-
-    def _init_client(self):
-        if self.provider == "openai":
-            if OpenAIClient is None:
-                raise ImportError("openai package not installed")
-            return OpenAIClient(api_key=self.api_key)
-        elif self.provider == "cohere":
-            if cohere is None:
-                raise ImportError("cohere package not installed")
-            return cohere.ClientV2(api_key=self.api_key)
-        elif self.provider == "huggingface":
-            if InferenceClient is None:
-                raise ImportError("huggingface_hub not installed")
-            return InferenceClient(api_key=self.api_key)
-        else:
-            raise ValueError(f"Unknown provider: {self.provider}")
-
-    def generate_stream(self, messages: List[dict]) -> Generator[str, None, None]:
-        if self.provider == "openai":
-            yield from self._openai_stream(messages)
-        elif self.provider == "cohere":
-            yield from self._cohere_stream(messages)
-        elif self.provider == "huggingface":
-            yield from self._hf_stream(messages)
-
-    def _openai_stream(self, messages: List[dict]) -> Generator[str, None, None]:
-        stream = self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            stream=True,
-            temperature=0.1,
-            max_tokens=1024,
-        )
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
-
-    def _cohere_stream(self, messages: List[dict]) -> Generator[str, None, None]:
-        # Convert to Cohere message format
-        cohere_messages = []
-        system_content = ""
-        for m in messages:
-            if m["role"] == "system":
-                system_content = m["content"]
-            else:
-                cohere_messages.append({"role": m["role"], "content": m["content"]})
-
-        stream = self._client.chat_stream(
-            model=self.model,
-            messages=cohere_messages,
-            system=system_content,
-            temperature=0.1,
-            max_tokens=1024,
-        )
-        for event in stream:
-            if event and hasattr(event, "delta") and hasattr(event.delta, "message"):
-                content = event.delta.message.content
-                if content:
-                    for part in content:
-                        if hasattr(part, "text"):
-                            yield part.text
-
-    def _hf_stream(self, messages: List[dict]) -> Generator[str, None, None]:
-        stream = self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            stream=True,
-            temperature=0.1,
-            max_tokens=1024,
-        )
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
+    def system_prompt(self) -> str:
+        base = POLICY_SYSTEM_PROMPTS.get(self._mode, POLICY_SYSTEM_PROMPTS["Free"])
+        if self._custom_text:
+            base += f"\n\nAdditional policy constraints:\n{self._custom_text[:2000]}"
+        return base
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main RAG Engine
+# LLM router — Cohere v2 FIX HERE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LLMRouter:
+    def __init__(self):
+        self.provider: Optional[str] = None
+        self.model: Optional[str] = None
+        self._client = None
+
+    def configure(self, provider: str, api_key: str, model: str) -> None:
+        self.provider = provider
+        self.model = model
+
+        if provider == "cohere":
+            import cohere
+            # cohere >= 5.0 uses ClientV2
+            try:
+                self._client = cohere.ClientV2(api_key)
+            except AttributeError:
+                # Fallback for older cohere versions
+                self._client = cohere.Client(api_key)
+
+        elif provider == "openai":
+            from openai import OpenAI
+            self._client = OpenAI(api_key=api_key)
+
+        elif provider == "huggingface":
+            from huggingface_hub import InferenceClient
+            self._client = InferenceClient(token=api_key)
+
+        else:
+            raise ValueError(f"Unknown provider: {provider}")
+
+    def stream(
+        self,
+        system_prompt: str,
+        chat_history: List[dict],
+        user_message: str,
+        context: str,
+    ) -> Generator[str, None, None]:
+        if self._client is None:
+            raise RuntimeError("LLM not configured. Call configure() first.")
+
+        # Build the user turn with context injected
+        user_with_context = (
+            f"Document context:\n{context}\n\n"
+            f"Question: {user_message}"
+        )
+
+        if self.provider == "cohere":
+            yield from self._stream_cohere(system_prompt, chat_history, user_with_context)
+        elif self.provider == "openai":
+            yield from self._stream_openai(system_prompt, chat_history, user_with_context)
+        elif self.provider == "huggingface":
+            yield from self._stream_huggingface(system_prompt, chat_history, user_with_context)
+
+    # ── Cohere v2 — THE FIX ─────────────────────────────────────────────────
+    def _stream_cohere(
+        self,
+        system_prompt: str,
+        chat_history: List[dict],
+        user_message: str,
+    ) -> Generator[str, None, None]:
+        """
+        Cohere v2 fix:
+          - system prompt → messages[0] with role="system"
+          - user message  → messages[-1] with role="user"
+          - NO top-level system= kwarg (removed in v2)
+          - NO top-level message= kwarg (removed in v2)
+          - Streaming event type: "content-delta" (not "text-generation")
+          - Token access: event.delta.message.content.text
+        """
+        messages = [{"role": "system", "content": system_prompt}]
+
+        # Add prior turns (filter to only user/assistant roles)
+        for turn in chat_history:
+            if turn.get("role") in ("user", "assistant"):
+                messages.append({"role": turn["role"], "content": turn["content"]})
+
+        # Current user turn
+        messages.append({"role": "user", "content": user_message})
+
+        response = self._client.chat_stream(
+            model=self.model,
+            messages=messages,
+            temperature=0.3,
+        )
+
+        for event in response:
+            # v2 event type is "content-delta"
+            if hasattr(event, "type") and event.type == "content-delta":
+                try:
+                    token = event.delta.message.content.text
+                    if token:
+                        yield token
+                except (AttributeError, TypeError):
+                    pass
+            # Fallback: some v2 builds use different attribute paths
+            elif hasattr(event, "delta") and hasattr(event.delta, "text"):
+                token = event.delta.text
+                if token:
+                    yield token
+
+    # ── OpenAI ──────────────────────────────────────────────────────────────
+    def _stream_openai(
+        self,
+        system_prompt: str,
+        chat_history: List[dict],
+        user_message: str,
+    ) -> Generator[str, None, None]:
+        messages = [{"role": "system", "content": system_prompt}]
+        for turn in chat_history:
+            if turn.get("role") in ("user", "assistant"):
+                messages.append({"role": turn["role"], "content": turn["content"]})
+        messages.append({"role": "user", "content": user_message})
+
+        stream = self._client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.3,
+            stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta and delta.content:
+                yield delta.content
+
+    # ── HuggingFace ─────────────────────────────────────────────────────────
+    def _stream_huggingface(
+        self,
+        system_prompt: str,
+        chat_history: List[dict],
+        user_message: str,
+    ) -> Generator[str, None, None]:
+        messages = [{"role": "system", "content": system_prompt}]
+        for turn in chat_history:
+            if turn.get("role") in ("user", "assistant"):
+                messages.append({"role": turn["role"], "content": turn["content"]})
+        messages.append({"role": "user", "content": user_message})
+
+        try:
+            stream = self._client.chat_completion(
+                model=self.model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=1024,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    yield delta.content
+        except Exception:
+            # Pseudo-streaming fallback for models that don't stream
+            response = self._client.chat_completion(
+                model=self.model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=1024,
+                stream=False,
+            )
+            text = response.choices[0].message.content or ""
+            # Yield in small chunks to simulate streaming in Streamlit
+            words = text.split()
+            for i in range(0, len(words), 5):
+                yield " ".join(words[i:i+5]) + " "
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main engine — public API consumed by app.py
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FinancialRAGEngine:
-    def __init__(self, use_reranker: bool = True):
-        self._parser = DocumentParser()
-        self._chunker = FinancialChunker(chunk_size=900, overlap=150)
-        self._store = FAISSVectorStore(use_reranker=use_reranker)
-        self._llm: Optional[LLMRouter] = None
-        self._policy_text: Optional[str] = None
-        self._policy_mode: str = "Free"
+    """
+    Public interface:
+        engine.configure_llm(provider, api_key, model)
+        engine.set_policy(mode, policy_text)
+        n = engine.ingest_file(file_bytes, filename)
+        stream, results, latency_ms = engine.query_stream(...)
+        engine.stats  → dict
+        engine._store.uses_reranker → bool
+    """
 
-    # ── Setup ─────────────────────────────────────────────────────────────────
+    def __init__(self, use_reranker: bool = True):
+        self._parser  = DocumentParser()
+        self._chunker = FinancialChunker(chunk_size=900, overlap=150)
+        self._store   = VectorStore(use_reranker=use_reranker)
+        self._policy  = PolicyEngine()
+        self._llm     = LLMRouter()
+
+    # ── Configuration ────────────────────────────────────────────────────────
 
     def configure_llm(self, provider: str, api_key: str, model: str) -> None:
-        self._llm = LLMRouter(provider=provider, api_key=api_key, model=model)
+        self._llm.configure(provider, api_key, model)
 
     def set_policy(self, mode: str, policy_text: Optional[str] = None) -> None:
-        self._policy_mode = mode
-        self._policy_text = policy_text
+        self._policy.set(mode, policy_text)
 
-    def clear_index(self) -> None:
-        self._store.clear()
-
-    # ── Ingestion ─────────────────────────────────────────────────────────────
+    # ── Ingestion ────────────────────────────────────────────────────────────
 
     def ingest_file(self, file_bytes: bytes, filename: str) -> int:
-        """Parse + chunk + embed a file. Returns number of chunks added."""
+        """Parse, chunk, embed and index a file. Returns number of chunks added."""
         pages = self._parser.parse(file_bytes, filename)
         all_chunks: List[Chunk] = []
         for text, page_num in pages:
-            chunks = self._chunker.split(text, source=filename, page=page_num)
+            chunks = self._chunker.chunk(text, source=filename, page=page_num)
             all_chunks.extend(chunks)
         self._store.add_chunks(all_chunks)
         return len(all_chunks)
 
-    # ── Query ─────────────────────────────────────────────────────────────────
+    # ── Query ────────────────────────────────────────────────────────────────
 
     def query_stream(
         self,
@@ -515,44 +511,43 @@ class FinancialRAGEngine:
         rerank_top_n: int = 3,
     ) -> Tuple[Generator[str, None, None], List[RetrievalResult], float]:
         """
-        Returns (token_stream, retrieval_results, query_latency_ms).
-        Caller consumes the stream for real-time display.
+        Returns (token_stream, retrieval_results, retrieval_latency_ms).
+        The token stream is a generator — iterate it to get streamed tokens.
         """
-        if not self._store.is_ready:
-            raise RuntimeError("No documents indexed. Please upload and process documents first.")
-        if self._llm is None:
-            raise RuntimeError("LLM not configured. Please provide API key and select a model.")
-
+        # Retrieval
         t0 = time.perf_counter()
         results = self._store.search(question, top_k=top_k, rerank_top_n=rerank_top_n)
         latency_ms = (time.perf_counter() - t0) * 1000
 
-        messages = _build_rag_prompt(
-            query=question,
-            results=results,
+        # Build context string
+        context_parts = []
+        for i, r in enumerate(results, 1):
+            context_parts.append(
+                f"[Source {i}: {r.chunk.source}, Page {r.chunk.page}]\n{r.chunk.text}"
+            )
+        context = "\n\n---\n\n".join(context_parts) if context_parts else "No relevant documents found."
+
+        # Stream
+        system_prompt = self._policy.system_prompt()
+        stream = self._llm.stream(
+            system_prompt=system_prompt,
             chat_history=chat_history,
-            policy_mode=self._policy_mode,
-            policy_text=self._policy_text,
+            user_message=question,
+            context=context,
         )
 
-        stream = self._llm.generate_stream(messages)
         return stream, results, latency_ms
 
-    # ── Metadata ──────────────────────────────────────────────────────────────
-
-    @property
-    def is_ready(self) -> bool:
-        return self._store.is_ready and self._llm is not None
+    # ── Stats ────────────────────────────────────────────────────────────────
 
     @property
     def stats(self) -> dict:
         return {
-            "total_chunks": self._store.total_chunks,
-            "chunk_size": self._chunker.chunk_size,
-            "overlap": self._chunker.overlap,
-            "embed_model": FAISSVectorStore.EMBED_MODEL,
-            "reranker": FAISSVectorStore.RERANK_MODEL if self._store.uses_reranker else "disabled",
-            "policy_mode": self._policy_mode,
-            "llm_provider": self._llm.provider if self._llm else "none",
-            "llm_model": self._llm.model if self._llm else "none",
+            "total_chunks":  self._store.total_chunks,
+            "chunk_size":    f"{self._chunker.chunk_size}/{self._chunker.overlap}",
+            "overlap":       self._chunker.overlap,
+            "embed_model":   VectorStore.EMBED_MODEL,
+            "reranker":      VectorStore.RERANKER_MODEL if self._store.uses_reranker else "disabled",
+            "llm_provider":  self._llm.provider or "not configured",
+            "llm_model":     self._llm.model or "not configured",
         }
