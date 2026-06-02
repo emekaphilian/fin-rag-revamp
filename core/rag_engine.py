@@ -279,11 +279,27 @@ class FAISSVectorStore:
                 score=float(score),
             ))
 
+        # Deduplicate retrieved chunks (preserve first occurrence order)
+        seen_ids = set()
+        unique_results: List[RetrievalResult] = []
+        for r in results:
+            cid = getattr(r.chunk, "chunk_id", None)
+            if cid is None:
+                # Fallback to source/page/text hash if chunk_id not present
+                cid = f"{r.chunk.source}:{r.chunk.page}:{hash(r.chunk.text)}"
+            if cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            unique_results.append(r)
+
+        results = unique_results
+
         # ── Cross-encoder reranking ───────────────────────────────────────────
         if self._reranker and results:
             pairs = [[query, r.chunk.text] for r in results]
             rerank_scores = self._reranker.predict(pairs)
             for r, rs in zip(results, rerank_scores):
+                # store raw reranker score; downstream code sorts descending
                 r.rerank_score = float(rs)
             results.sort(key=lambda x: x.rerank_score or 0, reverse=True)
             results = results[:rerank_top_n]
