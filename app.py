@@ -2,21 +2,10 @@
 app.py  ←  Streamlit Cloud entry point
 ---------------------------------------
 Financial Document Intelligence Assistant — Revamped
-Features:
-  - Persistent chat history (per session)
-  - Real-time streaming answers
-  - Multi-LLM selector (OpenAI / Cohere / HuggingFace)
-  - Better chunking + cross-encoder reranking
-  - Policy-aware modes
-  - Source attribution with confidence badges
-  - Retrieval insights panel
-  - Streamlit Cloud-ready (st.secrets + no torch)
 """
 
 import sys
 import os
-
-# Make sure core/ is importable when running from project root
 sys.path.insert(0, os.path.dirname(__file__))
 
 import streamlit as st
@@ -31,9 +20,6 @@ from core.models import (
     model_display_names,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Page config
-# ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="FinDoc AI — Financial RAG Assistant",
     page_icon="📊",
@@ -41,96 +27,67 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Custom CSS
-# ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* Main font */
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-
-/* Chat bubbles */
 .user-bubble {
-    background: #1a1f2e;
-    border: 1px solid #2d3748;
-    border-radius: 12px 12px 2px 12px;
-    padding: 12px 16px;
-    margin: 8px 0;
-    color: #e2e8f0;
+    background: #1a1f2e; border: 1px solid #2d3748;
+    border-radius: 12px 12px 2px 12px; padding: 12px 16px;
+    margin: 8px 0; color: #e2e8f0;
 }
 .assistant-bubble {
-    background: #0f172a;
-    border: 1px solid #1e3a5f;
-    border-left: 3px solid #3b82f6;
-    border-radius: 2px 12px 12px 12px;
-    padding: 14px 18px;
-    margin: 8px 0;
-    color: #e2e8f0;
-    line-height: 1.7;
+    background: #0f172a; border: 1px solid #1e3a5f;
+    border-left: 3px solid #3b82f6; border-radius: 2px 12px 12px 12px;
+    padding: 14px 18px; margin: 8px 0; color: #e2e8f0; line-height: 1.7;
 }
-
-/* Source cards */
 .source-card {
-    background: #111827;
-    border: 1px solid #1e293b;
-    border-radius: 8px;
-    padding: 10px 14px;
-    margin: 6px 0;
-    font-size: 0.85em;
-    color: #94a3b8;
+    background: #111827; border: 1px solid #1e293b;
+    border-radius: 8px; padding: 10px 14px; margin: 6px 0;
+    font-size: 0.85em; color: #94a3b8;
 }
 .source-card strong { color: #60a5fa; }
-
-/* Confidence badges */
 .badge-high   { background:#064e3b; color:#6ee7b7; border-radius:4px; padding:2px 8px; font-size:0.78em; }
 .badge-medium { background:#451a03; color:#fcd34d; border-radius:4px; padding:2px 8px; font-size:0.78em; }
 .badge-low    { background:#450a0a; color:#fca5a5; border-radius:4px; padding:2px 8px; font-size:0.78em; }
-
-/* Sidebar styling */
-.sidebar-section {
-    background: #1a1f2e;
-    border-radius: 8px;
-    padding: 12px;
-    margin: 8px 0;
-}
-
-/* Metric cards */
-.metric-row {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-}
+.metric-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .metric-card {
-    background: #1e293b;
-    border-radius: 8px;
-    padding: 10px 14px;
-    flex: 1;
-    min-width: 100px;
-    text-align: center;
+    background: #1e293b; border-radius: 8px; padding: 10px 14px;
+    flex: 1; min-width: 100px; text-align: center;
 }
 .metric-val { font-size: 1.4em; font-weight: 700; color: #38bdf8; }
 .metric-lbl { font-size: 0.75em; color: #64748b; margin-top: 2px; }
 
-/* Hide streamlit default menu items */
+/* Settings toggle button */
+.settings-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 8px 14px;
+    color: #94a3b8;
+    font-size: 0.9em;
+    cursor: pointer;
+    margin-bottom: 4px;
+}
+.settings-toggle:hover { background: #263548; border-color: #3b82f6; color: #e2e8f0; }
+
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
-
-/* Sticky input area */
 .stChatInputContainer { border-top: 1px solid #1e293b; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Session state initialisation
-# ─────────────────────────────────────────────────────────────────────────────
 def init_state():
     defaults = {
         "engine": None,
-        "chat_history": [],      # list of {"role": ..., "content": ...}
-        "display_history": [],   # list of {"role", "content", "results", "latency_ms"}
-        "docs_indexed": [],      # filenames indexed
+        "chat_history": [],
+        "display_history": [],
+        "docs_indexed": [],
         "llm_configured": False,
         "provider": "cohere",
         "model": DEFAULT_MODELS["cohere"],
@@ -139,6 +96,7 @@ def init_state():
         "top_k": 6,
         "rerank_top_n": 3,
         "use_reranker": True,
+        "settings_open": False,   # ← NEW: retrieval settings collapsed by default
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -147,9 +105,6 @@ def init_state():
 init_state()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Engine factory (cached per session to avoid re-loading embedder)
-# ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading embedding models…")
 def get_engine(use_reranker: bool) -> FinancialRAGEngine:
     return FinancialRAGEngine(use_reranker=use_reranker)
@@ -161,49 +116,38 @@ def get_or_create_engine() -> FinancialRAGEngine:
     return st.session_state.engine
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Sidebar
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 📊 FinDoc AI")
     st.markdown("*Financial Document Intelligence*")
     st.divider()
 
-    # ── LLM Configuration ─────────────────────────────────────────────────
+    # LLM Configuration
     st.markdown("### 🤖 LLM Configuration")
-
     provider_options = list(PROVIDER_DISPLAY_NAMES.keys())
-    provider_labels = [PROVIDER_DISPLAY_NAMES[p] for p in provider_options]
-    provider_idx = provider_options.index(st.session_state.provider)
+    provider_labels  = [PROVIDER_DISPLAY_NAMES[p] for p in provider_options]
+    provider_idx     = provider_options.index(st.session_state.provider)
 
-    selected_label = st.selectbox(
-        "Provider",
-        provider_labels,
-        index=provider_idx,
-        key="provider_select",
-    )
-    new_provider = provider_options[provider_labels.index(selected_label)]
+    selected_label = st.selectbox("Provider", provider_labels, index=provider_idx, key="provider_select")
+    new_provider   = provider_options[provider_labels.index(selected_label)]
     if new_provider != st.session_state.provider:
-        st.session_state.provider = new_provider
-        st.session_state.model = DEFAULT_MODELS[new_provider]
+        st.session_state.provider       = new_provider
+        st.session_state.model          = DEFAULT_MODELS[new_provider]
         st.session_state.llm_configured = False
 
-    # Model selector
-    model_map = model_display_names(st.session_state.provider)
-    model_ids = list(model_map.keys())
-    model_labels = list(model_map.values())
-    cur_model_idx = model_ids.index(st.session_state.model) if st.session_state.model in model_ids else 0
-
+    model_map            = model_display_names(st.session_state.provider)
+    model_ids            = list(model_map.keys())
+    model_labels         = list(model_map.values())
+    cur_model_idx        = model_ids.index(st.session_state.model) if st.session_state.model in model_ids else 0
     selected_model_label = st.selectbox("Model", model_labels, index=cur_model_idx)
     st.session_state.model = model_ids[model_labels.index(selected_model_label)]
 
-    # API Key — try st.secrets first, fallback to text input
-    secret_key = f"{st.session_state.provider}_api_key"
+    secret_key           = f"{st.session_state.provider}_api_key"
     api_key_from_secrets = st.secrets.get(secret_key, "") if hasattr(st, "secrets") else ""
 
     if api_key_from_secrets:
         api_key = api_key_from_secrets
-        st.success(f"✅ API key loaded from secrets")
+        st.success("✅ API key loaded from secrets")
     else:
         api_key = st.text_input(
             f"{PROVIDER_DISPLAY_NAMES[st.session_state.provider]} API Key",
@@ -229,9 +173,8 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Document Upload ────────────────────────────────────────────────────
+    # Document Upload
     st.markdown("### 📄 Documents")
-
     uploaded_files = st.file_uploader(
         "Upload financial documents",
         type=["pdf", "docx", "txt"],
@@ -243,8 +186,8 @@ with st.sidebar:
         new_files = [f for f in uploaded_files if f.name not in st.session_state.docs_indexed]
         if new_files:
             if st.button(f"⚙️ Process {len(new_files)} new file(s)", use_container_width=True):
-                engine = get_or_create_engine()
-                progress = st.progress(0)
+                engine       = get_or_create_engine()
+                progress     = st.progress(0)
                 total_chunks = 0
                 for i, uf in enumerate(new_files):
                     with st.spinner(f"Indexing {uf.name}…"):
@@ -267,13 +210,12 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Policy Mode ────────────────────────────────────────────────────────
+    # Policy Mode
     st.markdown("### 🛡️ Compliance Policy")
-
     policy_descriptions = {
-        "Free": "No constraints — general assistant behaviour",
+        "Free":      "No constraints — general assistant behaviour",
         "Assistive": "Guides tone; professional financial framing",
-        "Strict": "Only answers from document evidence; cites sources",
+        "Strict":    "Only answers from document evidence; cites sources",
     }
     st.session_state.policy_mode = st.radio(
         "Mode",
@@ -284,9 +226,7 @@ with st.sidebar:
     st.caption(policy_descriptions[st.session_state.policy_mode])
 
     policy_doc = st.file_uploader(
-        "Upload policy document (optional)",
-        type=["pdf", "txt"],
-        key="policy_upload",
+        "Upload policy document (optional)", type=["pdf", "txt"], key="policy_upload"
     )
     if policy_doc:
         if policy_doc.name.endswith(".pdf"):
@@ -304,20 +244,35 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Retrieval Settings ─────────────────────────────────────────────────
-    with st.expander("⚙️ Retrieval Settings", expanded=False):
-        st.session_state.top_k = st.slider(
-            "Initial retrieval (top-K)", 3, 12, st.session_state.top_k
-        )
-        st.session_state.rerank_top_n = st.slider(
-            "After reranking (top-N)", 1, 6, st.session_state.rerank_top_n
-        )
-        st.caption(
-            f"Fetches {st.session_state.top_k} candidates, "
-            f"reranks to best {st.session_state.rerank_top_n}."
-        )
+    # ── Retrieval Settings — toggle button ────────────────────────────────
+    chevron = "▲" if st.session_state.settings_open else "▼"
+    toggle_label = f"⚙️ Retrieval Settings  {chevron}"
 
-    # ── Reset ──────────────────────────────────────────────────────────────
+    if st.button(toggle_label, use_container_width=True, key="settings_toggle_btn"):
+        st.session_state.settings_open = not st.session_state.settings_open
+        st.rerun()
+
+    if st.session_state.settings_open:
+        with st.container():
+            st.session_state.top_k = st.slider(
+                "Initial retrieval (top-K)",
+                min_value=3,
+                max_value=12,
+                value=st.session_state.top_k,
+                help="How many chunks to fetch from the vector index before reranking.",
+            )
+            st.session_state.rerank_top_n = st.slider(
+                "After reranking (top-N)",
+                min_value=1,
+                max_value=6,
+                value=st.session_state.rerank_top_n,
+                help="How many chunks to keep after the cross-encoder reranker scores them.",
+            )
+            st.caption(
+                f"Fetches **{st.session_state.top_k}** candidates → "
+                f"reranks to best **{st.session_state.rerank_top_n}**."
+            )
+
     st.divider()
     if st.button("🔄 Reset Session", use_container_width=True):
         for key in list(st.session_state.keys()):
@@ -326,32 +281,30 @@ with st.sidebar:
         st.rerun()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main area: Header + Status bar
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Main area ─────────────────────────────────────────────────────────────────
 col_title, col_status = st.columns([3, 1])
 with col_title:
     st.markdown("# 📊 Financial Document Intelligence Assistant")
     st.markdown(
-        "*Upload financial documents, then ask questions — grounded answers with full source attribution.*"
+        "*Upload financial documents, then ask questions — "
+        "grounded answers with full source attribution.*"
     )
 
 with col_status:
     engine_status = get_or_create_engine()
-    llm_ok = st.session_state.llm_configured
+    llm_ok  = st.session_state.llm_configured
     docs_ok = bool(st.session_state.docs_indexed)
-
     st.markdown(f"**LLM:** {'🟢 Ready' if llm_ok else '🔴 Not connected'}")
-    st.markdown(f"**Index:** {'🟢 ' + str(engine_status.stats['total_chunks']) + ' chunks' if docs_ok else '🔴 No docs'}")
+    st.markdown(
+        f"**Index:** {'🟢 ' + str(engine_status.stats['total_chunks']) + ' chunks' if docs_ok else '🔴 No docs'}"
+    )
     st.markdown(f"**Reranker:** {'🟢 On' if engine_status._store.uses_reranker else '🟡 Off'}")
     st.markdown(f"**Mode:** `{st.session_state.policy_mode}`")
 
 st.divider()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Chat display
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Chat + Insights ───────────────────────────────────────────────────────────
 chat_col, insight_col = st.columns([2, 1])
 
 with chat_col:
@@ -370,7 +323,6 @@ with chat_col:
         </div>
         """, unsafe_allow_html=True)
 
-    # Render chat history
     for turn in st.session_state.display_history:
         if turn["role"] == "user":
             st.markdown(
@@ -382,27 +334,23 @@ with chat_col:
                 f'<div class="assistant-bubble">🤖 {turn["content"]}</div>',
                 unsafe_allow_html=True,
             )
-            # Show sources inline under each answer
             if turn.get("results"):
                 with st.expander(
-                    f"📎 {len(turn['results'])} source(s) · ⚡ {turn.get('latency_ms', 0):.0f}ms retrieval",
+                    f"📎 {len(turn['results'])} source(s) · "
+                    f"⚡ {turn.get('latency_ms', 0):.0f}ms retrieval",
                     expanded=False,
                 ):
                     for i, r in enumerate(turn["results"], 1):
                         badge_cls = f"badge-{r.confidence_label.lower()}"
                         score_val = r.rerank_score if r.rerank_score is not None else r.score
-                        st.markdown(
-                            f"""<div class="source-card">
+                        st.markdown(f"""<div class="source-card">
                             <strong>Source {i}: {r.chunk.source}</strong>
                             &nbsp; Page {r.chunk.page}
                             &nbsp; <span class="{badge_cls}">{r.confidence_label}</span>
                             &nbsp; score: {score_val:.3f}<br>
                             <em>{r.chunk.text[:280].strip()}…</em>
-                            </div>""",
-                            unsafe_allow_html=True,
-                        )
+                        </div>""", unsafe_allow_html=True)
 
-    # ── Chat input ────────────────────────────────────────────────────────
     question = st.chat_input(
         "Ask a question about your financial documents…",
         disabled=not (llm_ok and docs_ok),
@@ -414,16 +362,13 @@ with chat_col:
         elif not docs_ok:
             st.warning("Please upload and process documents first.")
         else:
-            # Add user turn to display
             st.session_state.display_history.append({"role": "user", "content": question})
-            # Add to LLM chat history (clean format)
             st.session_state.chat_history.append({"role": "user", "content": question})
 
-            # Stream the answer
             answer_placeholder = st.empty()
-            full_answer = ""
-            retrieval_results = []
-            retrieval_latency = 0.0
+            full_answer        = ""
+            retrieval_results  = []
+            retrieval_latency  = 0.0
 
             try:
                 engine = get_or_create_engine()
@@ -431,7 +376,7 @@ with chat_col:
 
                 stream, retrieval_results, retrieval_latency = engine.query_stream(
                     question=question,
-                    chat_history=st.session_state.chat_history[:-1],  # exclude current user turn
+                    chat_history=st.session_state.chat_history[:-1],
                     top_k=st.session_state.top_k,
                     rerank_top_n=st.session_state.rerank_top_n,
                 )
@@ -448,27 +393,21 @@ with chat_col:
                 full_answer = f"⚠️ Error: {e}"
                 answer_placeholder.error(full_answer)
 
-            # Save complete turn
             st.session_state.display_history.append({
-                "role": "assistant",
-                "content": full_answer,
-                "results": retrieval_results,
+                "role":       "assistant",
+                "content":    full_answer,
+                "results":    retrieval_results,
                 "latency_ms": retrieval_latency,
             })
             st.session_state.chat_history.append({"role": "assistant", "content": full_answer})
             st.rerun()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Right panel: Insights
-# ─────────────────────────────────────────────────────────────────────────────
 with insight_col:
     st.markdown("### 🔍 Retrieval Insights")
-
     engine = get_or_create_engine()
-    stats = engine.stats
+    stats  = engine.stats
 
-    # System metrics
     st.markdown("**System**")
     st.markdown(f"""
     <div class="metric-row">
@@ -480,8 +419,7 @@ with insight_col:
             <div class="metric-val">{stats['chunk_size']}</div>
             <div class="metric-lbl">Chunk size</div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+    </div>""", unsafe_allow_html=True)
 
     st.markdown(f"""
     <div style="margin:8px 0; font-size:0.82em; color:#64748b;">
@@ -490,13 +428,11 @@ with insight_col:
         <b>Overlap:</b> {stats['overlap']} tokens<br>
         <b>Provider:</b> {stats['llm_provider'].capitalize()}<br>
         <b>Model:</b> {stats['llm_model'].split('/')[-1] if '/' in stats['llm_model'] else stats['llm_model']}
-    </div>
-    """, unsafe_allow_html=True)
+    </div>""", unsafe_allow_html=True)
 
     st.divider()
-
-    # Last query results
     st.markdown("**Last Query Sources**")
+
     last_assistant = next(
         (t for t in reversed(st.session_state.display_history) if t["role"] == "assistant"),
         None,
@@ -506,24 +442,19 @@ with insight_col:
         results = last_assistant["results"]
         latency = last_assistant.get("latency_ms", 0)
         st.caption(f"⚡ Retrieval: {latency:.0f}ms")
-
         for i, r in enumerate(results, 1):
             score_val = r.rerank_score if r.rerank_score is not None else r.score
             badge_cls = f"badge-{r.confidence_label.lower()}"
-            st.markdown(f"""
-            <div class="source-card">
+            st.markdown(f"""<div class="source-card">
                 <strong>#{i} {r.chunk.source}</strong>
                 &nbsp;<span class="{badge_cls}">{r.confidence_color} {r.confidence_label}</span><br>
                 Page {r.chunk.page} · Score: {score_val:.3f}<br>
                 <em style="font-size:0.9em;">{r.chunk.text[:120].strip()}…</em>
-            </div>
-            """, unsafe_allow_html=True)
+            </div>""", unsafe_allow_html=True)
     else:
         st.caption("No query yet.")
 
     st.divider()
-
-    # Chat history stats
     st.markdown("**Session**")
     n_turns = len([t for t in st.session_state.display_history if t["role"] == "user"])
     st.markdown(f"""
@@ -536,10 +467,9 @@ with insight_col:
             <div class="metric-val">{len(st.session_state.docs_indexed)}</div>
             <div class="metric-lbl">Docs</div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+    </div>""", unsafe_allow_html=True)
 
     if st.button("🗑️ Clear Chat History", use_container_width=True):
         st.session_state.display_history = []
-        st.session_state.chat_history = []
+        st.session_state.chat_history    = []
         st.rerun()
