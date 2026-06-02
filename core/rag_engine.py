@@ -430,29 +430,33 @@ class LLMRouter:
                 yield delta
 
     def _cohere_stream(self, messages: List[dict]) -> Generator[str, None, None]:
-        # Convert to Cohere message format
-        cohere_messages = []
-        system_content = ""
-        for m in messages:
-            if m["role"] == "system":
-                system_content = m["content"]
-            else:
-                cohere_messages.append({"role": m["role"], "content": m["content"]})
-
         stream = self._client.chat_stream(
             model=self.model,
-            messages=cohere_messages,
-            system=system_content,
+            messages=messages,
             temperature=0.1,
             max_tokens=1024,
         )
         for event in stream:
-            if event and hasattr(event, "delta") and hasattr(event.delta, "message"):
-                content = event.delta.message.content
-                if content:
-                    for part in content:
-                        if hasattr(part, "text"):
-                            yield part.text
+            if getattr(event, "type", None) != "content-delta":
+                continue
+
+            message = getattr(event.delta, "message", None)
+            if message is None:
+                continue
+
+            content = getattr(message, "content", None)
+            if content is None:
+                continue
+
+            if isinstance(content, list):
+                for part in content:
+                    text = getattr(part, "text", None)
+                    if text:
+                        yield text
+            else:
+                text = getattr(content, "text", None)
+                if text:
+                    yield text
 
     def _hf_stream(self, messages: List[dict]) -> Generator[str, None, None]:
         stream = self._client.chat.completions.create(

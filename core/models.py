@@ -24,9 +24,12 @@ PROVIDER_MODELS: Dict[str, List[ModelInfo]] = {
         ModelInfo("gpt-3.5-turbo",   "GPT-3.5 Turbo",     16_385,  "Budget option"),
     ],
     "cohere": [
-        ModelInfo("command-r-plus",  "Command R+",        128_000, "Cohere flagship"),
-        ModelInfo("command-r",       "Command R",         128_000, "Balanced"),
-        ModelInfo("command",         "Command",            4_096,  "Fast"),
+        ModelInfo(
+            "command-a-03-2025",
+            "Command A",
+            256_000,
+            "Latest Cohere model"
+        ),
     ],
     "huggingface": [
         ModelInfo("meta-llama/Llama-3.3-70B-Instruct",    "Llama 3.3 70B",   128_000, "Strong open model"),
@@ -44,7 +47,7 @@ PROVIDER_DISPLAY_NAMES = {
 
 DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
-    "cohere": "command-r-plus",
+    "cohere": "command-a-03-2025",
     "huggingface": "meta-llama/Llama-3.3-70B-Instruct",
 }
 
